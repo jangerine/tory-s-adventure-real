@@ -8,71 +8,121 @@ const io = new Server(server);
 
 app.use(express.static('public'));
 
-// 게임 상태 관리
-let players = {};
-let assignedKeys = {};
-const availableKeys = ['w', 'a', 's', 'd'];
+// 방(Room) 데이터 저장소
+// rooms[roomId] = { players: { socketId: { key } }, gameState: { ... }, keys: [...] }
+const rooms = {};
 
-// 토리 캐릭터 위치 및 상태
-let gameState = {
-  x: 400,
-  y: 300,
-  speed: 3,
-  direction: { x: 0, y: -1 } // 초기 방향: 위쪽
-};
+// 랜덤 방 코드 생성 (4자리 영문 대문자)
+function generateRoomCode() {
+  return Math.random().toString(36).substring(2, 6).toUpperCase();
+}
 
 io.on('connection', (socket) => {
-  console.log('플레이어 접속:', socket.id);
+  let currentRoom = null;
 
-  // 접속한 플레이어에게 남아있는 키 배정
-  const assignedKey = availableKeys.find(key => !Object.values(assignedKeys).includes(key));
+  // 1. 방 만들기
+  socket.on('createRoom', () => {
+    const roomId = generateRoomCode();
+    rooms[roomId] = {
+      players: {},
+      availableKeys: ['w', 'a', 's', 'd'],
+      gameState: { x: 400, y: 300, speed: 3, direction: { x: 0, y: -1 } }
+    };
 
-  if (assignedKey) {
-    assignedKeys[socket.id] = assignedKey;
-    socket.emit('assignKey', assignedKey);
-  } else {
-    socket.emit('assignKey', '관전자 (키 없음)');
-  }
+    joinRoom(socket, roomId);
+  });
 
-  // 플레이어 접속 현황 업데이트
-  io.emit('updatePlayers', Object.keys(assignedKeys).length);
-
-  // 키 입력 이벤트 수신
-  socket.on('keypress', (key) => {
-    if (assignedKeys[socket.id] === key) {
-      if (key === 'w') gameState.direction = { x: 0, y: -1 };
-      if (key === 's') gameState.direction = { x: 0, y: 1 };
-      if (key === 'a') gameState.direction = { x: -1, y: 0 };
-      if (key === 'd') gameState.direction = { x: 1, y: 0 };
+  // 2. 방 참가가 (방 코드 입력)
+  socket.on('joinRoom', (roomId) => {
+    roomId = roomId.toUpperCase();
+    if (rooms[roomId]) {
+      joinRoom(socket, roomId);
+    } else {
+      socket.emit('errorMsg', '존재하지 않는 방 코드입니다.');
     }
   });
 
-  // 접속 종료 처리
+  // 방 입장 내부 로직
+  function joinRoom(sock, roomId) {
+    const room = rooms[roomId];
+    
+    // 이미 4명이 찬 경우
+    if (Object.keys(room.players).length >= 4) {
+      sock.emit('errorMsg', '방이 가득 찼습니다. (최대 4명)');
+      return;
+    }
+
+    currentRoom = roomId;
+    sock.join(roomId);
+
+    // 남아있는 키 배정
+    const assignedKey = room.availableKeys.shift();
+    room.players[sock.id] = { key: assignedKey };
+
+    // 클라이언트에 방 입장 완료 알림
+    sock.emit('roomJoined', { roomId, assignedKey });
+
+    // 해당 방 전체 인원에게 접속자 수 알림
+    io.to(roomId).emit('updatePlayers', Object.keys(room.players).length);
+  }
+
+  // 3. 키 입력 이벤트
+  socket.on('keypress', (key) => {
+    if (!currentRoom || !rooms[currentRoom]) return;
+    const room = rooms[currentRoom];
+    const player = room.players[socket.id];
+
+    if (player && player.key === key) {
+      if (key === 'w') room.gameState.direction = { x: 0, y: -1 };
+      if (key === 's') room.gameState.direction = { x: 0, y: 1 };
+      if (key === 'a') room.gameState.direction = { x: -1, y: 0 };
+      if (key === 'd') room.gameState.direction = { x: 1, y: 0 };
+    }
+  });
+
+  // 4. 퇴장 및 접속 종료
   socket.on('disconnect', () => {
-    console.log('플레이어 나가기:', socket.id);
-    delete assignedKeys[socket.id];
-    io.emit('updatePlayers', Object.keys(assignedKeys).length);
+    if (currentRoom && rooms[currentRoom]) {
+      const room = rooms[currentRoom];
+      const player = room.players[socket.id];
+
+      if (player) {
+        // 사용하던 키 반납
+        room.availableKeys.push(player.key);
+        delete room.players[socket.id];
+      }
+
+      // 방에 아무도 없으면 방 삭제
+      if (Object.keys(room.players).length === 0) {
+        delete rooms[currentRoom];
+      } else {
+        io.to(currentRoom).emit('updatePlayers', Object.keys(room.players).length);
+      }
+    }
   });
 });
 
-// 게임 루프: 멈추지 않고 계속 이동 및 충돌 체크
+// 60FPS 방별 게임 루프
 setInterval(() => {
-  gameState.x += gameState.direction.x * gameState.speed;
-  gameState.y += gameState.direction.y * gameState.speed;
+  for (const roomId in rooms) {
+    const room = rooms[roomId];
+    const state = room.gameState;
 
-  // 벽 충돌 체크 (800x600 캔버스 기준)
-  if (gameState.x < 15 || gameState.x > 785 || gameState.y < 15 || gameState.y > 585) {
-    // 사망 시 초기화
-    gameState.x = 400;
-    gameState.y = 300;
-    gameState.direction = { x: 0, y: -1 };
-    io.emit('gameOver');
+    // 움직임 계산
+    state.x += state.direction.x * state.speed;
+    state.y += state.direction.y * state.speed;
+
+    // 벽 충돌 체크
+    if (state.x < 15 || state.x > 785 || state.y < 15 || state.y > 585) {
+      state.x = 400;
+      state.y = 300;
+      state.direction = { x: 0, y: -1 };
+      io.to(roomId).emit('gameOver');
+    }
+
+    io.to(roomId).emit('gameState', state);
   }
-
-  io.emit('gameState', gameState);
 }, 1000 / 60);
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
