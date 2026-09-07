@@ -1,0 +1,13 @@
+{
+  "name": "tori-adventure",
+  "version": "1.0.0",
+  "description": "WASD Tori's Adventure Web Game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}
